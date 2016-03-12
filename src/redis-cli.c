@@ -1090,6 +1090,132 @@ static sds *cliSplitArgs(char *line, int *argc) {
     }
 }
 
+/* Convert an argument to a natural number. */
+static long argton(sds s) {
+    errno = 0;
+    char *endptr;
+    long val = strtol(s,&endptr,10);
+    if ((errno == ERANGE && (val == LONG_MAX || val == LONG_MIN))
+            || (errno != 0)
+            || (val <= 0)
+            || (endptr == s)
+            || (*endptr != '\0'))
+        return(0);
+    else
+        return(val);
+}
+
+/* Handle command modifiers and variables substitution.
+ * The syntax for a user provided command is:
+ *     [modifiers] <command> [arguments]
+ * The optional modifiers are:
+ *   - repeat: any integer number, n, causes the command to be repeated n times.
+ *     Specifying muliple repeats is allowed, but only the last one counts.
+ *   - shell command: the bang character, "!", executes the argument that
+ *     follows it as a shell command. The shell command's output is assigned
+ *     after trimmig white-spaces, to the dynamic variable "!n", where n is the
+ *     command's positional reference.
+ * Arguments are replaced by their respective variables. Substition is performed
+ * when the variable exists for the following patterns:
+ *   - ![n]: the nth shell command output, e.g. '!2' refers to the output of the
+ *     second shell command. When n isn't provided it defaults to 1, and "!!"
+ *     represents all outputs.
+ *
+ * */
+static int cliPreprocessCommand(int *repeat, sds *argv, int argc) {
+    int skipargs = 0;
+    sds *shellvars = zmalloc(sizeof(sds)*argc);
+    int shellvarc = 0;
+
+    while (skipargs < argc) {
+        errno = 0;
+        long number = argton(argv[skipargs]);
+        if (number) {
+            *repeat = number;
+            skipargs++;
+        } else if (!strcasecmp(argv[skipargs],"!")) {
+            if (skipargs >= argc-1) {
+                printf("Modifier ! requires a shell command argument\n");
+                skipargs = -1;
+                goto cleanup;
+            }
+
+            sds pout;
+            FILE *fp;
+            char buf[1024];
+            size_t nread;
+
+            /* Execute shell command and assign it to variable. */
+            fp = popen(argv[skipargs+1],"r");
+            if (!fp) {
+                fprintf(stderr, "Shell returned %s\n", strerror(errno));
+                skipargs = -1;
+                goto cleanup;
+            }
+            pout = sdsempty();
+            while((nread = fread(buf,1,sizeof(buf),fp)) != 0) {
+                pout = sdscatlen(pout,buf,nread);
+            }
+            if (pclose(fp) == -1) {
+                fprintf(stderr,
+                    "Failed closing shell command process: %s\n",
+                    strerror(errno));
+                exit(1);
+            }
+            pout = sdstrim(pout," \n\r\t\f");
+            if (!sdslen(pout)) {
+                fprintf(stderr, "Shell returned naught\n");
+                sdsfree(pout);
+                skipargs = -1;
+                goto cleanup;
+            }
+            shellvars[shellvarc++] = pout;
+            skipargs += 2;
+        } else {
+            break;
+        }
+    }
+    /* Substitute variables. */
+    if (shellvarc) {
+        int i, j;
+        long number;
+        sds var;
+
+        for (i = skipargs; i < argc; i++) {
+            if (argv[i][0] == '!') {
+                if (sdslen(argv[i]) == 1) {
+                    sdsfree(argv[i]);
+                    argv[i] = sdsdup(shellvars[0]);
+                } else if (argv[i][1] == '!' && sdslen(argv[i]) == 2) {
+                    var = sdsempty();
+                    for (j = 0; j < shellvarc; j++) {
+                        var = sdscatsds(var,shellvars[j]);
+                    }
+                    sdsfree(argv[i]);
+                    argv[i] = var;
+                } else {
+                    var = sdsdup(argv[i]);
+                    sdsrange(var,1,-1);
+                    number = argton(var);
+                    if (number && --number < shellvarc) {
+                        sdsfree(argv[i]);
+                        argv[i] = sdsdup(shellvars[number]);
+                    }
+                    sdsfree(var);
+                }
+            }
+        }
+    }
+
+cleanup:
+    zfree(shellvars);
+    if (skipargs == argc) {
+        *repeat = 1;
+        skipargs = 0;
+    }
+    return(skipargs);
+}
+
 static void repl(void) {
     sds historyfile = NULL;
     int history = 0;
@@ -1130,6 +1256,8 @@ static void repl(void) {
                     if (config.eval) {
                         config.eval_ldb = 1;
                         config.output = OUTPUT_RAW;
+                        sdsfreesplitres(argv,argc);
+                        free(line);
                         return; /* Return to evalMode to restart the session. */
                     } else {
                         printf("Use 'restart' only in Lua debugging mode.");
@@ -1143,31 +1271,27 @@ static void repl(void) {
                 } else if (argc == 1 && !strcasecmp(argv[0],"clear")) {
                     linenoiseClearScreen();
                 } else {
-                    long long start_time = mstime(), elapsed;
-                    int repeat, skipargs = 0;
+                    long long start_time, elapsed;
+                    int repeat = 1;
+                    int skipargs = cliPreprocessCommand(&repeat, argv, argc);
+                    if (skipargs >= 0) {
+                        start_time = mstime();
+                        issueCommandRepeat(argc-skipargs, argv+skipargs, repeat);
 
-                    repeat = atoi(argv[0]);
-                    if (argc > 1 && repeat) {
-                        skipargs = 1;
-                    } else {
-                        repeat = 1;
-                    }
+                        /* If our debugging session ended, show the EVAL final
+                         * reply. */
+                        if (config.eval_ldb_end) {
+                            config.eval_ldb_end = 0;
+                            cliReadReply(0);
+                            printf("\n(Lua debugging session ended%s)\n\n",
+                                config.eval_ldb_sync ? "" :
+                                " -- dataset changes rolled back");
+                        }
 
-                    issueCommandRepeat(argc-skipargs, argv+skipargs, repeat);
-
-                    /* If our debugging session ended, show the EVAL final
-                     * reply. */
-                    if (config.eval_ldb_end) {
-                        config.eval_ldb_end = 0;
-                        cliReadReply(0);
-                        printf("\n(Lua debugging session ended%s)\n\n",
-                            config.eval_ldb_sync ? "" :
-                            " -- dataset changes rolled back");
-                    }
-
-                    elapsed = mstime()-start_time;
-                    if (elapsed >= 500) {
-                        printf("(%.2fs)\n",(double)elapsed/1000);
+                        elapsed = mstime()-start_time;
+                        if (elapsed >= 500) {
+                            printf("(%.2fs)\n",(double)elapsed/1000);
+                        }
                     }
                 }
             }
