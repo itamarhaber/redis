@@ -228,7 +228,8 @@ void HelloTypeAofRewrite(RedisModuleIO *aof, RedisModuleString *key, void *value
 
 /* The goal of this function is to return the amount of memory used by
  * the HelloType value. */
-size_t HelloTypeMemUsage(const void *value) {
+size_t HelloTypeMemUsage(const void *value, const long long samples) {
+    REDISMODULE_NOT_USED(samples);
     const struct HelloTypeObject *hto = value;
     struct HelloTypeNode *node = hto->head;
     return sizeof(*hto) + sizeof(*node)*hto->len;

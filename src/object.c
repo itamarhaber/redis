@@ -847,7 +847,7 @@ size_t objectComputeSize(robj *o, size_t sample_size) {
         moduleValue *mv = o->ptr;
         moduleType *mt = mv->type;
         if (mt->mem_usage != NULL) {
-            asize = mt->mem_usage(mv->value);
+            asize = mt->mem_usage(mv->value,samples);
         } else {
             asize = 0;
         }
